@@ -182,15 +182,21 @@ def main():
         # Tageswechsel: Startzähler aus dem Tagesdokument holen oder neu setzen
         key = dt.strftime("%Y-%m-%d")
         if key != day:
-            doc = store.get(f"days/{key}")
-            start = doc.get("start", {})
-            missing = {k: d[k] for k in COUNTERS if k in d and k not in start}
-            if missing:
-                start.update(missing)
-                start.setdefault("m", dt.hour * 60 + dt.minute)  # >15: Tag erst ab dieser Minute gezählt
-                store.set(f"days/{key}", {"date": key, "start": start}, merge=True)
+            start = store.get(f"days/{key}").get("start", {})
             day, acc = key, []
-            log.info("Tag %s, Startzähler %s", key, start)
+            log.info("Tag %s, Startzähler aus Firestore %s", key, start)
+        # Fehlende Startzähler nachtragen (z. B. Energy Meter erst später erreichbar)
+        missing = {k: d[k] for k in COUNTERS if k in d and k not in start}
+        if missing:
+            start.update(missing)
+            start.setdefault("m", dt.hour * 60 + dt.minute)  # >15: Tag erst ab dieser Minute gezählt
+            if any(k.startswith("grid") for k in missing) and start["m"] < dt.hour * 60 + dt.minute:
+                start["m"] = dt.hour * 60 + dt.minute
+            try:
+                store.set(f"days/{key}", {"date": key, "start": start}, merge=True)
+                log.info("Startzähler ergänzt: %s", missing)
+            except Exception as e:
+                log.warning("Startzähler schreiben fehlgeschlagen: %s", e)
 
         acc.append(d)
 
