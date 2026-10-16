@@ -1,0 +1,17 @@
+services:
+  pv-collector:
+    build: .
+    container_name: pv-collector
+    restart: unless-stopped
+    # host-Netz noetig, damit der Energy-Meter-Multicast im Container ankommt
+    network_mode: host
+    user: "1000:1000"
+    env_file: .env
+    environment:
+      TZ: Europe/Berlin
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/service-account.json
+    volumes:
+      - ./service-account.json:/run/secrets/service-account.json:ro
+    logging:
+      driver: json-file
+      options: { max-size: "1m", max-file: "2" }

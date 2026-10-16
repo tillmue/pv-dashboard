@@ -1,0 +1,45 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function userDoc(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function myEmail() { return request.auth.token.email.lower(); }
+    function inviteDoc(email) { return /databases/$(database)/documents/invites/$(email); }
+    // Mitglied = hat ein Benutzerdokument UND wurde vom Admin freigegeben
+    function isMember() { return signedIn() && exists(userDoc(request.auth.uid)) && get(userDoc(request.auth.uid)).data.approved == true; }
+    function isAdmin() { return isMember() && get(userDoc(request.auth.uid)).data.role == 'admin'; }
+
+    // Benutzer: Selbstregistrierung startet als viewer und NICHT freigegeben.
+    // Ausnahme: Wer eine von Hand angelegte Einladung (invites/{email}) hat, bekommt deren Rolle direkt.
+    match /users/{uid} {
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name', 'email', 'role', 'approved', 'created'])
+        && request.resource.data.email == myEmail()
+        && (
+          (request.resource.data.role == 'viewer' && request.resource.data.approved == false)
+          || (exists(inviteDoc(myEmail()))
+              && request.resource.data.role == get(inviteDoc(myEmail())).data.role
+              && request.resource.data.approved == true)
+        );
+      allow update: if isAdmin()
+        || (request.auth.uid == uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name']));
+      allow delete: if isAdmin();
+    }
+
+    match /invites/{email} {
+      allow read: if signedIn() && email == myEmail();
+      allow write: if isAdmin();
+    }
+
+    // Messdaten schreibt nur der Sammler (Admin-SDK, umgeht die Regeln). Lesen nur fuer Freigegebene.
+    match /live/{id}   { allow read: if isMember(); allow write: if false; }
+    match /days/{id}   { allow read: if isMember(); allow write: if false; }
+    match /months/{id} { allow read: if isMember(); allow write: if false; }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}
