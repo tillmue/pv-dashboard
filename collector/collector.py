@@ -20,7 +20,7 @@ TZ = ZoneInfo(os.getenv("TZ", "Europe/Berlin"))
 PV_IP = os.getenv("PV_IP", "192.168.178.104")
 BAT_IP = os.getenv("BAT_IP", "192.168.178.92")
 METER_IP = os.getenv("METER_IP", "192.168.178.103")
-POLL_S = int(os.getenv("POLL_S", "5"))
+POLL_S = int(os.getenv("POLL_S", "10"))
 LIVE_S = int(os.getenv("LIVE_S", "15"))
 POINT_S = int(os.getenv("POINT_S", "300"))
 DRY_RUN = os.getenv("DRY_RUN") == "1"
@@ -30,53 +30,63 @@ log = logging.getLogger("pv")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 
 # ---------- Modbus (nur lesen) ----------
+# Pro Gerät und Durchlauf genau EINE TCP-Verbindung, danach sofort schliessen,
+# damit die gridBox (steuert die Anlage ebenfalls per Modbus) nie um Verbindungen konkurrieren muss.
 _tid = 0
 
-def mb_read(ip, reg, count):
-    global _tid
-    _tid = (_tid + 1) & 0xFFFF
-    req = struct.pack(">HHHBBHH", _tid, 0, 6, 3, 0x04, reg, count)
-    with socket.create_connection((ip, 502), timeout=3) as s:
-        s.sendall(req)
+class Device:
+    def __init__(self, ip):
+        self.s = socket.create_connection((ip, 502), timeout=3)
+        self.ip = ip
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.s.close()
+
+    def read(self, reg, count):
+        global _tid
+        _tid = (_tid + 1) & 0xFFFF
+        self.s.sendall(struct.pack(">HHHBBHH", _tid, 0, 6, 3, 0x04, reg, count))
         resp = b""
         while len(resp) < 9 + 2 * count:
-            chunk = s.recv(256)
+            chunk = self.s.recv(256)
             if not chunk:
                 break
             resp += chunk
             if len(resp) >= 9 and resp[7] & 0x80:
                 break
-    if len(resp) < 9 or resp[7] & 0x80:
-        raise IOError(f"Modbus-Fehler {ip}:{reg}")
-    return resp[9:9 + resp[8]]
+        if len(resp) < 9 or resp[7] & 0x80:
+            raise IOError(f"Modbus-Fehler {self.ip}:{reg}")
+        return resp[9:9 + resp[8]]
 
-NAN = {(">i", 0x80000000), (">I", 0xFFFFFFFF), (">I", 0x80000000), (">Q", 0xFFFFFFFFFFFFFFFF), (">Q", 0x8000000000000000)}
-
-def val(ip, reg, fmt):
-    n = {">i": 2, ">I": 2, ">Q": 4}[fmt]
-    b = mb_read(ip, reg, n)
-    raw = struct.unpack(">I" if fmt == ">i" else fmt, b)[0]
-    if (fmt, raw) in NAN or (fmt == ">i" and raw == 0x80000000):
-        return None
-    return struct.unpack(fmt, b)[0]
+    def val(self, reg, fmt):
+        b = self.read(reg, {">i": 2, ">I": 2, ">Q": 4}[fmt])
+        raw = struct.unpack(">I" if fmt == ">i" else fmt, b)[0]
+        nan = {">i": (0x80000000,), ">I": (0x80000000, 0xFFFFFFFF), ">Q": (0x8000000000000000, 0xFFFFFFFFFFFFFFFF)}[fmt]
+        if raw in nan:
+            return None
+        return struct.unpack(fmt, b)[0]
 
 def read_devices():
     d = {}
     try:
-        d["pv_w"] = max(0, val(PV_IP, 30775, ">i") or 0)  # nachts NaN -> 0
-        d["pv_day_wh"] = val(PV_IP, 30535, ">I")
-        d["pv_total_wh"] = val(PV_IP, 30529, ">I")
+        with Device(PV_IP) as dev:
+            d["pv_w"] = max(0, dev.val(30775, ">i") or 0)  # nachts NaN -> 0
+            d["pv_day_wh"] = dev.val(30535, ">I")
+            d["pv_total_wh"] = dev.val(30529, ">I")
     except Exception as e:
         log.warning("Tripower nicht lesbar: %s", e)
     try:
-        ac = val(BAT_IP, 30775, ">i")
-        d["bat_w"] = ac  # positiv = Entladen, negativ = Laden
-        d["soc"] = val(BAT_IP, 30845, ">I")
-        t = val(BAT_IP, 30849, ">i")
-        d["bat_temp"] = None if t is None else t / 10
-        d["bat_health"] = val(BAT_IP, 30847, ">I")
-        d["bat_in_wh"] = val(BAT_IP, 31397, ">Q")
-        d["bat_out_wh"] = val(BAT_IP, 31401, ">Q")
+        with Device(BAT_IP) as dev:
+            d["bat_w"] = dev.val(30775, ">i")  # positiv = Entladen, negativ = Laden
+            d["soc"] = dev.val(30845, ">I")
+            t = dev.val(30849, ">i")
+            d["bat_temp"] = None if t is None else t / 10
+            d["bat_health"] = dev.val(30847, ">I")
+            d["bat_in_wh"] = dev.val(31397, ">Q")
+            d["bat_out_wh"] = dev.val(31401, ">Q")
     except Exception as e:
         log.warning("Sunny Island nicht lesbar: %s", e)
     return d
