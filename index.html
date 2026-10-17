@@ -56,6 +56,14 @@ h2 { font-size: 20px; letter-spacing: -0.01em; margin: 28px 0 10px; }
 .tile .val small { font-size: 17px; font-weight: 500; color: var(--ink2); margin-left: 2px; }
 .tile .note { color: var(--ink2); font-size: 13px; margin-top: 2px; }
 .kpi .val { font-size: 22px; }
+.flowcard { padding: 6px 4px 2px; }
+.flow-svg { display: block; width: 100%; max-width: 420px; margin: 0 auto; overflow: visible; }
+.flow-svg .flow { fill: none; stroke-linecap: round; stroke-dasharray: 0.1 14; animation: flowdash linear infinite; }
+@keyframes flowdash { from { stroke-dashoffset: 14.1; } to { stroke-dashoffset: 0; } }
+@media (prefers-reduced-motion: reduce) { .flow-svg .flow { animation: none; stroke-dasharray: none; opacity: .6; } }
+.flow-svg .fl-val { font: 600 20px -apple-system, "SF Pro Display", sans-serif; fill: var(--ink); letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.flow-svg .fl-unit { font-size: 13px; font-weight: 500; fill: var(--ink2); }
+.flow-svg .fl-lab { font-size: 12px; fill: var(--ink2); }
 .summary { font-size: 17px; line-height: 1.5; margin: 14px 2px 0; color: var(--ink); }
 .socbar { height: 8px; background: var(--grid); border-radius: 4px; margin-top: 10px; overflow: hidden; }
 .socbar > i { display: block; height: 100%; background: var(--bat); border-radius: 4px; }

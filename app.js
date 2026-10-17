@@ -1,6 +1,6 @@
 /* PV Zuhause: Web-App (PWA). Liest Live- und Verlaufsdaten aus Firestore, die der Sammler zu Hause schreibt.
    Ohne Firebase testbar mit ?demo=1 (erzeugt Beispieldaten im Browser). */
-export const APP_VERSION = '2026-10-17 a';
+export const APP_VERSION = '2026-10-17 b';
 
 const FBV = '10.14.1', FBBASE = 'https://www.gstatic.com/firebasejs/' + FBV + '/';
 const DEMO = new URLSearchParams(location.search).has('demo');
@@ -166,7 +166,6 @@ function liveView() {
   if (!L) return `<header><div><h1>Jetzt</h1></div></header><div class="loading">Warte auf Daten vom Sammler …</div>`;
   const age = Date.now() / 1000 - L.ts;
   const bat = L.bat_w ?? 0, grid = L.grid_w;
-  const batNote = Math.abs(bat) < 30 ? 'Ruhe' : bat < 0 ? 'lädt' : 'entlädt';
   const gridNote = (grid == null ? 'Zähler fehlt' : Math.abs(grid) < 30 ? 'ausgeglichen' : grid < 0 ? 'Einspeisung' : 'Bezug') + (L.grid_est ? ', geschätzt' : '');
   const t = L.today || {}, k = kpis(t);
   let warn = '';
@@ -177,15 +176,7 @@ function liveView() {
   <header><div><h1>Jetzt</h1><div class="sub">Stand ${new Date(L.ts * 1000).toLocaleTimeString('de-DE')}</div></div>
     <button class="icon-btn" data-act="refresh" aria-label="Aktualisieren">↻</button></header>
   ${warn}
-  <div class="grid2">
-    ${tile('--pv', 'Sonne', pw(L.pv_w), L.pv_w > 0 ? 'Erzeugung' : 'keine Erzeugung')}
-    ${tile('--house', 'Haus', pw(L.house_w), 'Verbrauch' + (L.grid_est ? ', geschätzt' : ''))}
-    <div class="card tile"><div class="lab"><span class="dot" style="background:var(--bat)"></span>Batterie</div>
-      <div class="val">${nf(L.soc)}<small>%</small></div>
-      <div class="note">${batNote}${Math.abs(bat) >= 30 ? ' mit ' + pw(bat).join(' ') : ''}</div>
-      <div class="socbar"><i style="width:${Math.max(0, Math.min(100, L.soc || 0))}%"></i></div></div>
-    ${tile('--net', 'Netz', pw(grid), gridNote)}
-  </div>
+  <div class="card flowcard">${flowSVG(L, gridNote)}</div>
   <p class="summary">${summary(L)}</p>
   <h2>Heute</h2>
   ${since}
@@ -199,6 +190,59 @@ function liveView() {
   </div>
   <p class="foot">Batterie ${L.bat_temp != null ? nf(L.bat_temp, 1) + ' °C · ' : ''}Kapazität ${nf(L.bat_health)} % · Gesamtertrag ${nf(L.pv_total_kwh)} kWh</p>`;
 }
+
+/* Energiefluss: Sonne oben, Netz links, Batterie rechts, Haus unten, alle über einen Knotenpunkt.
+   Punkte wandern in Flussrichtung, Tempo und Dicke steigen mit der Leistung. */
+function flowSVG(L, gridNote) {
+  const C = { x: 170, y: 190 }, R = 34;
+  const soc = Math.max(0, Math.min(100, L.soc || 0));
+  const N = {
+    pv:    { x: 170, y: 82,  color: '--pv',    w: L.pv_w || 0 },
+    grid:  { x: 52,  y: 190, color: '--net',   w: L.grid_w },
+    bat:   { x: 288, y: 190, color: '--bat',   w: L.bat_w || 0 },
+    house: { x: 170, y: 298, color: '--house', w: L.house_w }
+  };
+  /* dir +1 = Fluss zum Zentrum, -1 = vom Zentrum weg */
+  const line = (n, dir) => {
+    const dx = C.x - n.x, dy = C.y - n.y, len = Math.hypot(dx, dy);
+    const x1 = n.x + dx / len * R, y1 = n.y + dy / len * R;
+    const [a, b] = dir >= 0 ? [[x1, y1], [C.x, C.y]] : [[C.x, C.y], [x1, y1]];
+    const w = n.w, on = w != null && Math.abs(w) >= 30;
+    let out = `<line x1="${x1}" y1="${y1}" x2="${C.x}" y2="${C.y}" stroke="var(--grid)" stroke-width="3" stroke-linecap="round"/>`;
+    if (on) {
+      const dur = Math.max(0.35, 2.2 / (1 + Math.abs(w) / 700)).toFixed(2);
+      const width = Math.min(7, 3 + Math.abs(w) / 1200).toFixed(1);
+      out += `<path class="flow" d="M${a[0]},${a[1]}L${b[0]},${b[1]}" stroke="var(${n.color})" stroke-width="${width}" style="animation-duration:${dur}s"/>`;
+    }
+    return out;
+  };
+  const icon = {
+    pv: '<circle r="7" fill="none"/><path d="M0-15v4M0 11v4M-15 0h4M11 0h4M-10.6-10.6l2.8 2.8M7.8 7.8l2.8 2.8M-10.6 10.6l2.8-2.8M7.8-7.8l2.8-2.8"/>',
+    grid: '<path d="M-7 15L-2-14h4L7 15M-9-6h18M-8 4h16M-3-8l7 12M3-8l-7 12" fill="none"/>',
+    bat: `<rect x="-8" y="-12" width="16" height="26" rx="3" fill="none"/><path d="M-3-15h6"/><rect x="-4.5" y="${10.5 - 19 * soc / 100}" width="9" height="${19 * soc / 100}" rx="1.5" stroke="none" fill="currentColor"/>`,
+    house: '<path d="M-13-1L0-13 13-1M-9-4v16h18V-4M-3 12V4h6v8" fill="none"/>'
+  };
+  const node = (k, sub) => {
+    const n = N[k], [v, u] = pw(n.w);
+    const ty = k === 'pv' ? n.y - R - 28 : n.y + R + 22;
+    return `<g style="color:var(${n.color})">
+      <circle cx="${n.x}" cy="${n.y}" r="${R}" fill="var(--card)" stroke="currentColor" stroke-width="2.5"/>
+      <g transform="translate(${n.x},${n.y})" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${icon[k]}</g>
+      <text x="${n.x}" y="${ty}" text-anchor="middle" class="fl-val">${v}<tspan class="fl-unit"> ${u}</tspan></text>
+      <text x="${n.x}" y="${ty + 17}" text-anchor="middle" class="fl-lab">${sub}</text></g>`;
+  };
+  const bat = L.bat_w || 0;
+  const batSub = `Batterie ${nf(L.soc)} %` + (Math.abs(bat) < 30 ? '' : bat < 0 ? ', lädt' : ', entlädt');
+  return `<svg class="flow-svg" viewBox="0 0 340 382" role="img" aria-label="Energiefluss. ${esc(summary(L))}">
+    ${line(N.pv, 1)}${line(N.grid, (L.grid_w || 0) >= 0 ? 1 : -1)}${line(N.bat, bat >= 0 ? 1 : -1)}${line(N.house, -1)}
+    <circle cx="${C.x}" cy="${C.y}" r="5" fill="var(--ink3)"/>
+    ${node('pv', N.pv.w > 0 ? 'Sonne' : 'Sonne, keine Erzeugung')}
+    ${node('grid', 'Netz, ' + gridNote)}
+    ${node('bat', batSub)}
+    ${node('house', 'Haus' + (L.grid_est ? ', geschätzt' : ''))}
+  </svg>`;
+}
+
 const kpiTile = (label, v, u) => `<div class="card tile kpi"><div class="lab">${label}</div><div class="val">${v}<small>${u}</small></div></div>`;
 
 function summary(L) {
