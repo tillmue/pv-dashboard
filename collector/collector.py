@@ -87,6 +87,9 @@ def read_devices():
             d["bat_health"] = dev.val(30847, ">I")
             d["bat_in_wh"] = dev.val(31397, ">Q")
             d["bat_out_wh"] = dev.val(31401, ">Q")
+            # Netzzaehler, die der Sunny Island per Unicast vom Energy Meter bekommt (10-Wh-Schritte)
+            d["grid_in_si_wh"] = dev.val(30581, ">I")
+            d["grid_out_si_wh"] = dev.val(30583, ">I")
     except Exception as e:
         log.warning("Sunny Island nicht lesbar: %s", e)
     return d
@@ -160,7 +163,8 @@ class Store:
         self.db.document(path).set({**extra, "points": self.fs.ArrayUnion([point])}, merge=True)
 
 # ---------- Hauptschleife ----------
-COUNTERS = ("grid_in_wh", "grid_out_wh", "bat_in_wh", "bat_out_wh", "pv_total_wh")
+COUNTERS = ("grid_in_si_wh", "grid_out_si_wh", "bat_in_wh", "bat_out_wh", "pv_total_wh")
+EST_WINDOW_S = int(os.getenv("EST_WINDOW_S", "180"))
 
 def r1(x):
     return None if x is None else round(x, 1)
@@ -172,6 +176,7 @@ def main():
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
 
     day, start, acc = None, {}, []
+    hist = []  # (Zeit, Bezug Wh, Einspeisung Wh) aus dem Sunny Island fuer die Schaetzung
     last_live = last_point = 0
     log.info("Sammler gestartet (DRY_RUN=%s)", DRY_RUN)
     while not stop.is_set():
@@ -181,9 +186,18 @@ def main():
         m = dict(meter) if now - meter.get("ts", 0) < 30 else {}
         d.update({k: v for k, v in m.items() if k != "ts"})
 
-        grid = None
+        grid, grid_est = None, False
+        if d.get("grid_in_si_wh") is not None and d.get("grid_out_si_wh") is not None:
+            hist.append((now, d["grid_in_si_wh"], d["grid_out_si_wh"]))
+            hist = [h for h in hist if now - h[0] <= 900]
         if "grid_in_w" in d:
             grid = d["grid_in_w"] - d["grid_out_w"]  # positiv = Bezug, negativ = Einspeisung
+        elif hist and now - hist[0][0] >= 60:
+            # Rueckfall: mittlere Netzleistung aus Zaehlerdifferenz der letzten EST_WINDOW_S Sekunden
+            old = next((h for h in hist if now - h[0] <= EST_WINDOW_S), hist[0])
+            if now - old[0] >= 60:
+                grid = ((d["grid_in_si_wh"] - old[1]) - (d["grid_out_si_wh"] - old[2])) * 3600 / (now - old[0])
+                grid_est = True
         house = None
         if grid is not None and "pv_w" in d and d.get("bat_w") is not None:
             house = max(0, d["pv_w"] + d["bat_w"] + grid)
@@ -213,7 +227,7 @@ def main():
         totals = {}
         if d.get("pv_day_wh") is not None:
             totals["pv"] = d["pv_day_wh"]
-        for k, name in (("grid_in_wh", "grid_in"), ("grid_out_wh", "grid_out"), ("bat_in_wh", "bat_in"), ("bat_out_wh", "bat_out")):
+        for k, name in (("grid_in_si_wh", "grid_in"), ("grid_out_si_wh", "grid_out"), ("bat_in_wh", "bat_in"), ("bat_out_wh", "bat_out")):
             if k in d and k in start:
                 totals[name] = round(d[k] - start[k])
         if all(k in totals for k in ("pv", "grid_in", "grid_out", "bat_in", "bat_out")):
@@ -225,7 +239,7 @@ def main():
             live = {k: r1(v) for k, v in live.items()}
             live.update(ts=int(now), day=key, today=totals,
                         pv_total_kwh=r1((d.get("pv_total_wh") or 0) / 1000),
-                        today_since=start.get("m", 0), meter_ok=bool(m))
+                        today_since=start.get("m", 0), meter_ok=bool(m), grid_est=grid_est)
             try:
                 store.set("live/current", live)
             except Exception as e:

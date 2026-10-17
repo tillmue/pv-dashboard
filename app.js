@@ -1,6 +1,6 @@
 /* PV Zuhause: Web-App (PWA). Liest Live- und Verlaufsdaten aus Firestore, die der Sammler zu Hause schreibt.
    Ohne Firebase testbar mit ?demo=1 (erzeugt Beispieldaten im Browser). */
-export const APP_VERSION = '2026-10-16 a';
+export const APP_VERSION = '2026-10-17 a';
 
 const FBV = '10.14.1', FBBASE = 'https://www.gstatic.com/firebasejs/' + FBV + '/';
 const DEMO = new URLSearchParams(location.search).has('demo');
@@ -167,11 +167,11 @@ function liveView() {
   const age = Date.now() / 1000 - L.ts;
   const bat = L.bat_w ?? 0, grid = L.grid_w;
   const batNote = Math.abs(bat) < 30 ? 'Ruhe' : bat < 0 ? 'lädt' : 'entlädt';
-  const gridNote = grid == null ? 'Zähler fehlt' : Math.abs(grid) < 30 ? 'ausgeglichen' : grid < 0 ? 'Einspeisung' : 'Bezug';
+  const gridNote = (grid == null ? 'Zähler fehlt' : Math.abs(grid) < 30 ? 'ausgeglichen' : grid < 0 ? 'Einspeisung' : 'Bezug') + (L.grid_est ? ', geschätzt' : '');
   const t = L.today || {}, k = kpis(t);
   let warn = '';
   if (age > 120) warn += `<div class="banner warn">⚠️ <span>Der Sammler hat sich seit ${age > 5400 ? nf(age / 3600) + ' Stunden' : nf(age / 60) + ' Minuten'} nicht gemeldet. Die Werte sind nicht aktuell.</span></div>`;
-  else if (L.meter_ok === false) warn += `<div class="banner warn">⚠️ <span>Der Netzzähler liefert gerade keine Werte. Netz und Hausverbrauch fehlen.</span></div>`;
+  else if (L.meter_ok === false && L.grid_w == null) warn += `<div class="banner warn">⚠️ <span>Der Netzzähler liefert gerade keine Werte. Netz und Hausverbrauch fehlen.</span></div>`;
   const since = L.today_since > 15 ? `<div class="banner info">ℹ️ <span>Netz, Batterie und Verbrauch werden heute erst ab ${hm(L.today_since)} Uhr gezählt.</span></div>` : '';
   return `
   <header><div><h1>Jetzt</h1><div class="sub">Stand ${new Date(L.ts * 1000).toLocaleTimeString('de-DE')}</div></div>
@@ -179,7 +179,7 @@ function liveView() {
   ${warn}
   <div class="grid2">
     ${tile('--pv', 'Sonne', pw(L.pv_w), L.pv_w > 0 ? 'Erzeugung' : 'keine Erzeugung')}
-    ${tile('--house', 'Haus', pw(L.house_w), 'Verbrauch')}
+    ${tile('--house', 'Haus', pw(L.house_w), 'Verbrauch' + (L.grid_est ? ', geschätzt' : ''))}
     <div class="card tile"><div class="lab"><span class="dot" style="background:var(--bat)"></span>Batterie</div>
       <div class="val">${nf(L.soc)}<small>%</small></div>
       <div class="note">${batNote}${Math.abs(bat) >= 30 ? ' mit ' + pw(bat).join(' ') : ''}</div>
