@@ -12,7 +12,7 @@ Ziele in Firestore
 
 Es werden ausschliesslich Lese-Funktionen (Modbus FC 0x04) verwendet.
 """
-import json, logging, os, signal, socket, struct, threading, time
+import json, logging, os, signal, socket, struct, threading, time, urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -24,6 +24,14 @@ POLL_S = int(os.getenv("POLL_S", "10"))
 LIVE_S = int(os.getenv("LIVE_S", "15"))
 POINT_S = int(os.getenv("POINT_S", "300"))
 DRY_RUN = os.getenv("DRY_RUN") == "1"
+LAT = float(os.getenv("LAT", "52.27"))
+LON = float(os.getenv("LON", "8.05"))
+KWP = float(os.getenv("KWP", "4.0"))
+TILT = int(os.getenv("TILT", "45"))
+AZIMUTH = int(os.getenv("AZIMUTH", "45"))  # Open-Meteo: 0 = Sued, 45 = Suedwest
+PR = float(os.getenv("PR", "0.85"))        # Performance Ratio (Verluste)
+AC_MAX = int(os.getenv("AC_MAX", "4000"))
+BAT_KWH = float(os.getenv("BAT_KWH", "9.02"))
 CRED = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "/run/secrets/service-account.json")
 
 log = logging.getLogger("pv")
@@ -156,31 +164,118 @@ class Store:
             return
         self.db.document(path).set(data, merge=merge)
 
-    def append_point(self, path, point, extra):
+    def append(self, path, field, item, extra=None):
         if not self.db:
-            log.info("DRY %s +Punkt %s %s", path, point, extra)
+            log.info("DRY %s +%s %s", path, field, item)
             return
-        self.db.document(path).set({**extra, "points": self.fs.ArrayUnion([point])}, merge=True)
+        self.db.document(path).set({**(extra or {}), field: self.fs.ArrayUnion([item])}, merge=True)
+
+    def inc(self, path, data):
+        """Zahlen in verschachteltem dict als Firestore-Increment schreiben (neustartsicher)."""
+        if not self.db:
+            log.info("DRY %s +=%s", path, json.dumps(data)[:300])
+            return
+        def conv(x):
+            return {k: conv(v) for k, v in x.items()} if isinstance(x, dict) else self.fs.Increment(x)
+        self.db.document(path).set(conv(data), merge=True)
+
+# ---------- Börsenpreise und PV-Prognose (alle 30 min) ----------
+PRICES = {}    # "JJJJ-MM-TT" -> [(unix, EUR/kWh)]
+FORECAST = {}  # "JJJJ-MM-TT" -> {"m": [...], "w": [...], "kwh": x}
+
+def http_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "pv-dashboard-collector"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+def fetch_prices(store, days):
+    for dk in days:
+        try:
+            j = http_json(f"https://api.energy-charts.info/price?bzn=DE-LU&start={dk}&end={dk}")
+            rows = [(t, p / 1000) for t, p in zip(j["unix_seconds"], j["price"])
+                    if p is not None and datetime.fromtimestamp(t, TZ).strftime("%Y-%m-%d") == dk]
+            if len(rows) < 80 or rows == PRICES.get(dk):
+                continue
+            PRICES[dk] = rows
+            store.set(f"prices/{dk}", {
+                "m": [datetime.fromtimestamp(t, TZ).hour * 60 + datetime.fromtimestamp(t, TZ).minute for t, _ in rows],
+                "p": [round(p, 5) for _, p in rows], "unit": "EUR/kWh netto (Day-Ahead)", "ts": int(time.time())})
+            log.info("Preise %s: %d Werte", dk, len(rows))
+        except Exception as e:
+            log.warning("Preise %s nicht abrufbar: %s", dk, e)
+
+def fetch_forecast(store):
+    try:
+        j = http_json(f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}"
+                      f"&minutely_15=global_tilted_irradiance&tilt={TILT}&azimuth={AZIMUTH}"
+                      f"&forecast_days=2&timezone=Europe%2FBerlin")
+        q = j["minutely_15"]
+        by = {}
+        for t, g in zip(q["time"], q["global_tilted_irradiance"]):
+            dk, hm_ = t.split("T")
+            h, mi = map(int, hm_.split(":"))
+            w = 0 if g is None else min(AC_MAX, round(KWP * g * PR))
+            by.setdefault(dk, {"m": [], "w": []})
+            by[dk]["m"].append(h * 60 + mi)
+            by[dk]["w"].append(w)
+        for dk, f in by.items():
+            f["kwh"] = round(sum(f["w"]) * 0.25 / 1000, 2)
+            if FORECAST.get(dk, {}).get("w") == f["w"]:
+                continue
+            FORECAST[dk] = f
+            store.set(f"forecast/{dk}", {**f, "ts": int(time.time())})
+            log.info("Prognose %s: %.1f kWh", dk, f["kwh"])
+    except Exception as e:
+        log.warning("Prognose nicht abrufbar: %s", e)
+
+def fetch_loop(store, stop):
+    while not stop.is_set():
+        today = datetime.now(TZ)
+        tomorrow = datetime.fromtimestamp(time.time() + 86400, TZ)
+        fetch_prices(store, [today.strftime("%Y-%m-%d"), tomorrow.strftime("%Y-%m-%d")])
+        fetch_forecast(store)
+        stop.wait(1800)
+
+def price_at(ts):
+    rows = PRICES.get(datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d"))
+    if not rows:
+        return None
+    cur = None
+    for t, p in rows:
+        if t <= ts:
+            cur = p
+        else:
+            break
+    return cur
 
 # ---------- Hauptschleife ----------
 COUNTERS = ("grid_in_si_wh", "grid_out_si_wh", "bat_in_wh", "bat_out_wh", "pv_total_wh")
 EST_WINDOW_S = int(os.getenv("EST_WINDOW_S", "180"))
+BTG_ON, BTG_OFF = 300, 150  # Batterie -> Netz: Ereignis ab 300 W, Ende unter 150 W
 
 def r1(x):
     return None if x is None else round(x, 1)
 
 def main():
     store = Store()
-    threading.Thread(target=meter_listener, daemon=True).start()
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
+    threading.Thread(target=meter_listener, daemon=True).start()
+    threading.Thread(target=fetch_loop, args=(store, stop), daemon=True).start()
 
     day, start, acc = None, {}, []
-    hist = []  # (Zeit, Bezug Wh, Einspeisung Wh) aus dem Sunny Island fuer die Schaetzung
+    hist = []      # (Zeit, Bezug Wh, Einspeisung Wh) aus dem Sunny Island fuer die Schaetzung
+    extra = {}     # Tageswerte, die nicht aus Zaehlern kommen (Spitzen, Batterie->Netz)
+    pend = {}      # aufgelaufene Energie seit dem letzten Schreiben
+    ev = None      # laufendes Ereignis Batterie -> Netz
+    last_dir = 0   # letzte starke Batterie-Richtung: +1 entladen, -1 laden (fuer Richtungswechsel)
     last_live = last_point = 0
+    prev = time.time()
     log.info("Sammler gestartet (DRY_RUN=%s)", DRY_RUN)
     while not stop.is_set():
         now = time.time()
+        e_h = min(60, now - prev) / 3600  # Stunden seit dem letzten Durchlauf
+        prev = now
         dt = datetime.now(TZ)
         d = read_devices()
         m = dict(meter) if now - meter.get("ts", 0) < 30 else {}
@@ -203,10 +298,13 @@ def main():
             house = max(0, d["pv_w"] + d["bat_w"] + grid)
         d["grid_w"], d["house_w"] = grid, house
 
-        # Tageswechsel: Startzähler aus dem Tagesdokument holen oder neu setzen
+        # Tageswechsel: Startzähler und Tageswerte aus dem Tagesdokument holen
         key = dt.strftime("%Y-%m-%d")
         if key != day:
-            start = store.get(f"days/{key}").get("start", {})
+            doc = store.get(f"days/{key}")
+            start = doc.get("start", {})
+            t0 = doc.get("totals", {})
+            extra = {k: t0[k] for k in ("peak_pv", "peak_house", "bat_grid", "bat_from_grid", "flips", "tmin", "tmax") if k in t0}
             day, acc = key, []
             log.info("Tag %s, Startzähler aus Firestore %s", key, start)
         # Fehlende Startzähler nachtragen (z. B. Energy Meter erst später erreichbar)
@@ -224,6 +322,78 @@ def main():
 
         acc.append(d)
 
+        # Spitzen, Temperaturen
+        if d.get("pv_w") is not None:
+            extra["peak_pv"] = max(extra.get("peak_pv", 0), round(d["pv_w"]))
+        if house is not None and not grid_est:
+            extra["peak_house"] = max(extra.get("peak_house", 0), round(house))
+        if d.get("bat_temp") is not None:
+            extra["tmin"] = min(extra.get("tmin", 99), d["bat_temp"])
+            extra["tmax"] = max(extra.get("tmax", -99), d["bat_temp"])
+
+        # Auffaelligkeiten, auch ohne Energy Meter messbar:
+        # 1) Richtungswechsel: Batterie springt zwischen starkem Laden und Entladen (> 1 kW)
+        # 2) Laden aus dem Netz: Ladeleistung groesser als PV-Leistung
+        flip = 0
+        bw = d.get("bat_w")
+        if bw is not None:
+            dir_ = 1 if bw > 1000 else -1 if bw < -1000 else 0
+            if dir_ and last_dir and dir_ != last_dir:
+                flip = 1
+                extra["flips"] = extra.get("flips", 0) + 1
+            if dir_:
+                last_dir = dir_
+        bfg = 0
+        if bw is not None and d.get("pv_w") is not None:
+            bfg = max(0, -bw - d["pv_w"])
+            if bfg >= 300:
+                extra["bat_from_grid"] = round(extra.get("bat_from_grid", 0) + bfg * e_h, 1)
+
+        # Batterie speist ins Netz (z. B. Fremdsteuerung): Anteil der Entladung, der rausgeht
+        btg = 0
+        if grid is not None and d.get("bat_w") is not None:
+            btg = min(max(d["bat_w"], 0), max(-grid, 0))
+        if btg >= 100:
+            extra["bat_grid"] = round(extra.get("bat_grid", 0) + btg * e_h, 1)
+        if btg >= BTG_ON:
+            if not ev:
+                ev = {"start": int(now), "wh": 0.0, "peak": 0, "above": now}
+                log.info("Batterie speist ins Netz: %d W", btg)
+            ev["above"] = now
+        if ev:
+            ev["wh"] += btg * e_h
+            ev["peak"] = max(ev["peak"], round(btg))
+            if btg < BTG_OFF and now - ev["above"] > 60:
+                item = {"start": ev["start"], "end": int(now), "wh": round(ev["wh"]), "peak": ev["peak"], "soc": d.get("soc")}
+                ev = None
+                if item["wh"] >= 30:
+                    log.info("Ereignis Batterie -> Netz beendet: %s", item)
+                    try:
+                        store.append(f"days/{key}", "events", item)
+                        store.append("stats/batgrid", "events", item)
+                    except Exception as e:
+                        log.warning("Ereignis schreiben fehlgeschlagen: %s", e)
+
+        # Energie fuer Stundenwerte und Boersenpreis-Rechnung aufsummieren
+        hh = f"{dt.hour:02d}"
+        price = price_at(now)
+        imp = max(grid or 0, 0) * e_h / 1000   # kWh
+        exp = max(-(grid or 0), 0) * e_h / 1000
+        def add(path, val):
+            if val:
+                pend[path] = pend.get(path, 0) + val
+        add(("h", key, "pv", hh), (d.get("pv_w") or 0) * e_h)
+        add(("h", key, "house", hh), (house or 0) * e_h)
+        add(("h", key, "imp", hh), imp * 1000)
+        add(("h", key, "exp", hh), exp * 1000)
+        add(("h", key, "flips", hh), flip)
+        add(("h", key, "bfg", hh), bfg * e_h if bfg >= 300 else 0)
+        if price is not None:
+            add(("s", key, "imp_kwh"), imp)
+            add(("s", key, "imp_eur"), imp * price)
+            add(("s", key, "exp_kwh"), exp)
+            add(("s", key, "exp_eur"), exp * price)
+
         totals = {}
         if d.get("pv_day_wh") is not None:
             totals["pv"] = d["pv_day_wh"]
@@ -232,13 +402,22 @@ def main():
                 totals[name] = round(d[k] - start[k])
         if all(k in totals for k in ("pv", "grid_in", "grid_out", "bat_in", "bat_out")):
             totals["house"] = max(0, totals["pv"] + totals["grid_in"] - totals["grid_out"] + totals["bat_out"] - totals["bat_in"])
+        totals.update({k: (round(v, 1) if isinstance(v, float) else v) for k, v in extra.items()})
+        if d.get("bat_health") is not None:
+            totals["health"] = d["bat_health"]
 
         if now - last_live >= LIVE_S:
             last_live = now
             live = {k: d.get(k) for k in ("pv_w", "bat_w", "grid_w", "house_w", "soc", "bat_temp", "bat_health")}
             live = {k: r1(v) for k, v in live.items()}
+            tomorrow = datetime.fromtimestamp(now + 86400, TZ).strftime("%Y-%m-%d")
             live.update(ts=int(now), day=key, today=totals,
                         pv_total_kwh=r1((d.get("pv_total_wh") or 0) / 1000),
+                        bat_in_total_kwh=r1((d.get("bat_in_wh") or 0) / 1000),
+                        bat_out_total_kwh=r1((d.get("bat_out_wh") or 0) / 1000),
+                        bat_kwh=BAT_KWH, btg_w=round(btg), bfg_w=round(bfg),
+                        price=None if price is None else round(price, 5),
+                        fc_today=FORECAST.get(key, {}).get("kwh"), fc_tomorrow=FORECAST.get(tomorrow, {}).get("kwh"),
                         today_since=start.get("m", 0), meter_ok=bool(m), grid_est=grid_est)
             try:
                 store.set("live/current", live)
@@ -254,8 +433,22 @@ def main():
                      "grid": avg("grid_w"), "house": avg("house_w"), "soc": avg("soc")}
             acc = []
             try:
-                store.append_point(f"days/{key}", point, {"date": key, "totals": totals})
+                store.append(f"days/{key}", "points", point, {"date": key, "totals": totals})
                 store.set(f"months/{key[:7]}", {"days": {key[8:]: totals}}, merge=True)
+                # Stundenwerte je Monat: hours/JJJJ-MM -> {TT: {pv|house|imp|exp: {HH: Wh}}}
+                # Boersenpreis-Summen: days/{tag}.spot und months/{JJJJ-MM}.days.TT.spot
+                by_doc = {}
+                for k, v in pend.items():
+                    if k[0] == "h":
+                        _, dk, metric, h = k
+                        by_doc.setdefault(f"hours/{dk[:7]}", {}).setdefault(dk[8:], {}).setdefault(metric, {})[h] = round(v, 1)
+                    else:
+                        _, dk, metric = k
+                        by_doc.setdefault(f"days/{dk}", {}).setdefault("spot", {})[metric] = round(v, 6)
+                        by_doc.setdefault(f"months/{dk[:7]}", {}).setdefault("days", {}).setdefault(dk[8:], {}).setdefault("spot", {})[metric] = round(v, 6)
+                for path, data in by_doc.items():
+                    store.inc(path, data)
+                pend = {}
             except Exception as e:
                 log.warning("Verlauf schreiben fehlgeschlagen: %s", e)
 

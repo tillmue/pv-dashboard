@@ -39,6 +39,10 @@ service cloud.firestore {
     match /live/{id}   { allow read: if isMember(); allow write: if false; }
     match /days/{id}   { allow read: if isMember(); allow write: if false; }
     match /months/{id} { allow read: if isMember(); allow write: if false; }
+    match /hours/{id}    { allow read: if isMember(); allow write: if false; }
+    match /prices/{id}   { allow read: if isMember(); allow write: if false; }
+    match /forecast/{id} { allow read: if isMember(); allow write: if false; }
+    match /stats/{id}    { allow read: if isMember(); allow write: if false; }
 
     match /{document=**} { allow read, write: if false; }
   }

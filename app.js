@@ -1,6 +1,6 @@
 /* PV Zuhause: Web-App (PWA). Liest Live- und Verlaufsdaten aus Firestore, die der Sammler zu Hause schreibt.
    Ohne Firebase testbar mit ?demo=1 (erzeugt Beispieldaten im Browser). */
-export const APP_VERSION = '2026-10-17 b';
+export const APP_VERSION = '2026-10-17 c';
 
 const FBV = '10.14.1', FBBASE = 'https://www.gstatic.com/firebasejs/' + FBV + '/';
 const DEMO = new URLSearchParams(location.search).has('demo');
@@ -25,7 +25,7 @@ const PREF_KEY = 'pv-prefs';
 function prefs() {
   let p = {};
   try { p = JSON.parse(localStorage.getItem(PREF_KEY) || '{}'); } catch (e) {}
-  return { price: p.price ?? 0.35, feed: p.feed ?? 0.082, tab: p.tab || 'live' };
+  return { price: p.price ?? 0.35, feed: p.feed ?? 0.082, dyn: p.dyn ?? 0.20, tab: p.tab || 'live' };
 }
 function setPref(k, v) {
   const p = prefs(); p[k] = v;
@@ -67,6 +67,7 @@ async function firebaseSource() {
     async getDay(k) { const s = await FB.getDoc(FB.doc(db, 'days', k)); return s.exists() ? s.data() : null; },
     onDay(k, cb) { const u = FB.onSnapshot(FB.doc(db, 'days', k), s => cb(s.exists() ? s.data() : null)); unsubs.push(u); return u; },
     async getMonth(k) { const s = await FB.getDoc(FB.doc(db, 'months', k)); return s.exists() ? s.data() : null; },
+    async getDoc(c, id) { const s = await FB.getDoc(FB.doc(db, c, id)); return s.exists() ? s.data() : null; },
     onUsers(cb) { unsubs.push(FB.onSnapshot(FB.collection(db, 'users'), s => cb(s.docs.map(d => ({ id: d.id, ...d.data() }))))); },
     setUser: (id, data) => FB.updateDoc(FB.doc(db, 'users', id), data),
     delUser: id => FB.deleteDoc(FB.doc(db, 'users', id)),
@@ -108,19 +109,42 @@ function demoSource() {
       const tick = () => {
         const d = sim(dayKey(new Date()), nowM()), p = d.points[d.points.length - 1];
         cb({ pv_w: p.pv, bat_w: p.bat, grid_w: p.grid, house_w: p.house, soc: p.soc, bat_temp: 24.5, bat_health: 93,
-             ts: Math.floor(Date.now() / 1000), today: d.totals, today_since: 0, meter_ok: true, pv_total_kwh: 27612 });
+             ts: Math.floor(Date.now() / 1000), today: d.totals, today_since: 0, meter_ok: true, pv_total_kwh: 27612,
+             bat_in_total_kwh: 8534, bat_out_total_kwh: 6214, bat_kwh: 9.02, btg_w: 0, bfg_w: 0, price: 0.112, fc_today: 14.2, fc_tomorrow: 9.8 });
       };
       tick(); setInterval(tick, 15000);
     },
-    async getDay(k) { return k > dayKey(new Date()) ? null : sim(k, k === dayKey(new Date()) ? nowM() : 1435); },
+    async getDay(k) { if (k > dayKey(new Date())) return null; const d = sim(k, k === dayKey(new Date()) ? nowM() : 1435);
+      d.spot = { imp_kwh: d.totals.grid_in / 1000, imp_eur: d.totals.grid_in / 1000 * 0.105, exp_kwh: d.totals.grid_out / 1000, exp_eur: d.totals.grid_out / 1000 * 0.07 };
+      Object.assign(d.totals, { peak_pv: 2900, flips: 4, bat_from_grid: 350, bat_grid: 0 }); return d; },
     onDay(k, cb) { this.getDay(k).then(cb); return () => {}; },
     async getMonth(k) {
       const [y, mo] = k.split('-').map(Number), days = {}, last = new Date(y, mo, 0).getDate(), today = new Date();
       for (let d = 1; d <= last; d++) {
         const dk = `${k}-${pad(d)}`; if (dk > dayKey(today)) break;
-        days[pad(d)] = sim(dk, dk === dayKey(today) ? nowM() : 1435).totals;
+        const t = sim(dk, dk === dayKey(today) ? nowM() : 1435).totals;
+        days[pad(d)] = { ...t, peak_pv: 2400 + (d * 137) % 1300, peak_house: 3000 + (d * 71) % 2000, flips: d % 3 ? 0 : 7, bat_from_grid: d % 3 ? 0 : 600, bat_grid: d % 4 ? 0 : 400, health: 94,
+          spot: { imp_kwh: t.grid_in / 1000, imp_eur: t.grid_in / 1000 * 0.105, exp_kwh: t.grid_out / 1000, exp_eur: t.grid_out / 1000 * 0.07 } };
       }
       return { days };
+    },
+    async getDoc(c, id) {
+      /* Beispieldaten fuer Preise, Prognose, Stundenwerte und Ereignisse */
+      if (c === 'prices') { const m = [], p = []; for (let i = 0; i < 96; i++) { m.push(i * 15); const h = i / 4; p.push(+(0.09 + 0.05 * Math.cos((h - 3) / 24 * 2 * Math.PI) + 0.06 * Math.exp(-((h - 19) ** 2) / 3) - 0.04 * Math.exp(-((h - 13) ** 2) / 4)).toFixed(4)); } return { m, p }; }
+      if (c === 'forecast') { const d = sim(id, 1435), m = [], w = []; for (let i = 0; i < 96; i++) { const q = d.points[Math.min(d.points.length - 1, i * 3)]; m.push(i * 15); w.push(Math.round(q.pv * 0.92)); } return { m, w, kwh: +(w.reduce((a, b) => a + b, 0) * 0.25 / 1000).toFixed(1) }; }
+      if (c === 'hours') {
+        const [y, mo] = id.split('-').map(Number), last = new Date(y, mo, 0).getDate(), out = {}, td = dayKey(new Date());
+        for (let dd = 1; dd <= last; dd++) {
+          const dk = `${id}-${pad(dd)}`; if (dk > td) break;
+          const D = sim(dk, dk === td ? nowM() : 1435), H = { pv: {}, house: {}, imp: {}, flips: {}, bfg: {} };
+          for (const q of D.points) { const hh = pad(Math.floor(q.m / 60)); H.pv[hh] = (H.pv[hh] || 0) + q.pv / 12; H.house[hh] = (H.house[hh] || 0) + q.house / 12; H.imp[hh] = (H.imp[hh] || 0) + Math.max(0, q.grid) / 12; }
+          if (dd % 3 === 0) { H.flips['21'] = 6 + dd % 5; H.bfg['21'] = 300; }
+          out[pad(dd)] = H;
+        }
+        return out;
+      }
+      if (c === 'stats') return { events: [{ start: Date.now() / 1000 - 90000, end: Date.now() / 1000 - 89100, wh: 520, peak: 2480, soc: 98 }] };
+      return null;
     },
     onUsers: cb => cb([{ id: 'demo', ...profile }, { id: 'u2', name: 'Mama', email: 'mama@example.org', role: 'viewer', approved: false, created: Date.now() }]),
     setUser: async () => {}, delUser: async () => {}, stop() {}
@@ -148,10 +172,11 @@ function render() {
   if (S.profile.approved !== true) { $('#tabs').classList.add('hidden'); app.innerHTML = pendingView(); bindPending(); return; }
   $('#tabs').classList.remove('hidden');
   document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === S.tab));
-  const views = { live: liveView, day: dayView, month: monthView, more: moreView };
+  const views = { live: liveView, day: dayView, month: monthView, stat: statView, more: moreView };
   app.innerHTML = (views[S.tab] || liveView)();
   if (S.tab === 'day') drawDayCharts();
   if (S.tab === 'month') drawMonthChart();
+  if (S.tab === 'stat') drawStat();
   bindView();
 }
 
@@ -178,6 +203,12 @@ function liveView() {
   ${warn}
   <div class="card flowcard">${flowSVG(L, gridNote)}</div>
   <p class="summary">${summary(L)}</p>
+  ${L.btg_w >= 300 ? `<div class="banner warn" style="margin-top:12px">⚠️ <span>Die Batterie speist gerade ${pw(L.btg_w).join(' ')} ins Netz.</span></div>` : ''}
+  ${L.bfg_w >= 300 ? `<div class="banner warn" style="margin-top:12px">⚠️ <span>Die Batterie lädt gerade ${pw(L.bfg_w).join(' ')} aus dem Netz.</span></div>` : ''}
+  <div class="grid2" style="margin-top:14px">
+    <div class="card tile kpi"><div class="lab">Börsenpreis jetzt</div><div class="val">${L.price == null ? '–' : nf(L.price * 100, 1)}<small>ct</small></div><div class="note">dynamisch ca. ${L.price == null ? '–' : nf(dynPrice(L.price) * 100, 1)} ct</div></div>
+    <div class="card tile kpi"><div class="lab">Prognose</div><div class="val">${L.fc_today == null ? '–' : nf(L.fc_today, 1)}<small>kWh</small></div><div class="note">morgen ${L.fc_tomorrow == null ? '–' : nf(L.fc_tomorrow, 1) + ' kWh'}</div></div>
+  </div>
   <h2>Heute</h2>
   ${since}
   <div class="grid3">
@@ -268,9 +299,13 @@ function dayView() {
   const body = !D ? `<div class="card loading">Für diesen Tag gibt es keine Daten.</div>` : `
     <div class="card"><div class="lab sub">Leistung</div>
       <div class="chart" id="c-power"></div>
-      <div class="legend"><span><i style="background:var(--pv)"></i>Sonne</span><span><i style="background:var(--house)"></i>Haus</span><span><i style="background:var(--net)"></i>Netz (unter 0 = Einspeisung)</span></div>
+      <div class="legend"><span><i style="background:var(--pv)"></i>Sonne</span><span><i class="dash" style="--c:var(--pv)"></i>Prognose</span><span><i style="background:var(--house)"></i>Haus</span><span><i style="background:var(--net)"></i>Netz (unter 0 = Einspeisung)</span></div>
     </div>
     <div class="card" style="margin-top:12px"><div class="lab sub">Batterie-Ladestand</div><div class="chart" id="c-soc"></div></div>
+    ${S.dayPrices ? `<div class="card" style="margin-top:12px"><div class="lab sub">Strompreis dynamisch (ct pro kWh, brutto)</div><div class="chart" id="c-price"></div>
+      <div class="legend"><span><i style="background:var(--accent)"></i>Dynamischer Endpreis</span><span><i class="dash" style="--c:var(--ink3)"></i>Dein Tarif</span></div></div>` : ''}
+    ${tariffCard(D.spot, t)}
+    ${anomalyCard(t, D.events)}
     <h2>Summen</h2>
     ${D.start && D.start.m > 15 ? `<div class="banner info">ℹ️ <span>Netz, Batterie und Verbrauch erst ab ${hm(D.start.m)} Uhr gezählt.</span></div>` : ''}
     <div class="grid3">
@@ -300,9 +335,10 @@ function dayTable(D) {
 function lineChart(el, pts, series, opt) {
   if (!el) return;
   const W = el.clientWidth || 340, H = opt.h || 200, L = 42, R = 8, T = 10, B = 22;
-  const xs = m => L + (m / 1440) * (W - L - R);
+  const X0 = opt.x0 ?? 0, X1 = opt.x1 ?? 1440, xs = m => L + ((m - X0) / (X1 - X0)) * (W - L - R);
   let lo = opt.min ?? 0, hi = opt.max ?? 0;
   if (opt.max == null) for (const p of pts) for (const s of series) { const v = p[s.key]; if (v != null) { hi = Math.max(hi, v); lo = Math.min(lo, v); } }
+  if (opt.max == null) for (const r of opt.refs || []) { hi = Math.max(hi, r.v); lo = Math.min(lo, r.v); }
   if (opt.max == null) { const step = niceStep((hi - lo) / 4); hi = Math.ceil(hi / step) * step || step; lo = Math.floor(lo / step) * step; }
   const ys = v => T + (hi - v) / (hi - lo || 1) * (H - T - B);
   const step = opt.ticks || niceStep((hi - lo) / 4);
@@ -316,23 +352,26 @@ function lineChart(el, pts, series, opt) {
   for (const s of series) {
     const seg = pts.filter(p => p[s.key] != null);
     if (!seg.length) continue;
-    const d = seg.map((p, i) => `${i ? 'L' : 'M'}${xs(p.m).toFixed(1)},${ys(p[s.key]).toFixed(1)}`).join('');
+    const d = s.step
+      ? seg.map((p, i) => `${i ? `H${xs(p.m).toFixed(1)}V` : `M${xs(p.m).toFixed(1)},`}${ys(p[s.key]).toFixed(1)}`).join('')
+      : seg.map((p, i) => `${i ? 'L' : 'M'}${xs(p.m).toFixed(1)},${ys(p[s.key]).toFixed(1)}`).join('');
     if (s.area) marks += `<path d="${d}L${xs(seg[seg.length - 1].m)},${ys(0)}L${xs(seg[0].m)},${ys(0)}Z" fill="var(${s.color})" opacity=".16"/>`;
-    marks += `<path d="${d}" fill="none" stroke="var(${s.color})" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    marks += `<path d="${d}" fill="none" stroke="var(${s.color})" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"${s.dash ? ' stroke-dasharray="4 4" opacity=".9"' : ''}/>`;
   }
+  for (const r of opt.refs || []) marks += `<line x1="${L}" x2="${W - R}" y1="${ys(r.v)}" y2="${ys(r.v)}" stroke="var(${r.color})" stroke-width="1.5" stroke-dasharray="5 4"/>`;
   el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" height="${H}" role="img" aria-label="${esc(opt.aria)}">${g}${marks}
     <line class="xh" y1="${T}" y2="${H - B}" stroke="var(--ink3)" stroke-width="1" visibility="hidden"/>
     <g class="xd"></g><rect x="${L}" y="0" width="${W - L - R}" height="${H}" fill="transparent"/></svg><div class="tip"></div>`;
   const svg = el.querySelector('svg'), tip = el.querySelector('.tip'), xh = svg.querySelector('.xh'), xd = svg.querySelector('.xd');
   const move = ev => {
     const r = svg.getBoundingClientRect(), x = (ev.touches ? ev.touches[0].clientX : ev.clientX) - r.left;
-    const m = (x * W / r.width - L) / (W - L - R) * 1440;
+    const m = X0 + (x * W / r.width - L) / (W - L - R) * (X1 - X0);
     let best = null; for (const p of pts) if (!best || Math.abs(p.m - m) < Math.abs(best.m - m)) best = p;
     if (!best) return;
     const px = xs(best.m);
     xh.setAttribute('x1', px); xh.setAttribute('x2', px); xh.setAttribute('visibility', 'visible');
     xd.innerHTML = series.filter(s => best[s.key] != null).map(s => `<circle cx="${px}" cy="${ys(best[s.key])}" r="4.5" fill="var(${s.color})" stroke="var(--card)" stroke-width="2"/>`).join('');
-    tip.innerHTML = `<b>${hm(best.m)} Uhr</b>` + series.map(s => `<div class="row"><span class="dot" style="background:var(${s.color})"></span><span>${s.label}</span><span>${best[s.key] == null ? '–' : opt.tipFmt(best[s.key], s.key)}</span></div>`).join('');
+    tip.innerHTML = `<b>${opt.xLabel ? opt.xLabel(best.m) : hm(best.m) + ' Uhr'}</b>` + series.map(s => `<div class="row"><span class="dot" style="background:var(${s.color})"></span><span>${s.label}</span><span>${best[s.key] == null ? '–' : opt.tipFmt(best[s.key], s.key)}</span></div>`).join('');
     tip.style.display = 'block';
     const sx = px * r.width / W, tw = tip.offsetWidth;
     tip.style.left = Math.max(0, Math.min(r.width - tw, sx + (sx > r.width / 2 ? -tw - 12 : 12))) + 'px';
@@ -349,15 +388,60 @@ function niceStep(raw) {
 
 function drawDayCharts() {
   const D = S.day; if (!D) return;
-  const pts = D.points || [];
+  /* Messpunkte und Prognose (15 min) auf eine gemeinsame Zeitachse legen */
+  const byM = new Map();
+  for (const q of D.points || []) byM.set(q.m, { ...q });
+  const F = S.dayForecast;
+  if (F) F.m.forEach((m, i) => { const o = byM.get(m) || { m }; o.fc = F.w[i]; byM.set(m, o); });
+  const pts = [...byM.values()].sort((a, b) => a.m - b.m);
   const fmtW = v => Math.abs(v) >= 1000 ? nf(v / 1000, v % 1000 ? 1 : 0) + ' kW' : nf(v) + ' W';
   lineChart($('#c-power'), pts, [
     { key: 'pv', color: '--pv', label: 'Sonne', area: true },
+    { key: 'fc', color: '--pv', label: 'Prognose', dash: true },
     { key: 'house', color: '--house', label: 'Haus' },
     { key: 'grid', color: '--net', label: 'Netz' }
   ], { h: 220, aria: 'Leistungsverlauf des Tages', fmt: fmtW, tipFmt: (v, k) => k !== 'grid' ? pw(v).join(' ') : Math.abs(v) < 30 ? '0 W' : pw(v).join(' ') + (v < 0 ? ' raus' : ' rein') });
   lineChart($('#c-soc'), pts, [{ key: 'soc', color: '--bat', label: 'Ladestand', area: true }],
     { h: 120, min: 0, max: 100, ticks: 50, aria: 'Batterie-Ladestand des Tages', fmt: v => v + ' %', tipFmt: v => nf(v) + ' %' });
+  const P = S.dayPrices;
+  if (P) {
+    const pp = P.m.map((m, i) => ({ m, dyn: +(dynPrice(P.p[i]) * 100).toFixed(1) }));
+    pp.push({ m: 1440, dyn: pp[pp.length - 1].dyn });
+    lineChart($('#c-price'), pp, [{ key: 'dyn', color: '--accent', label: 'Endpreis', step: true }],
+      { h: 150, aria: 'Dynamischer Strompreis des Tages', refs: [{ v: prefs().price * 100, color: '--ink3' }],
+        fmt: v => nf(v) + ' ct', tipFmt: v => nf(v, 1) + ' ct' });
+  }
+}
+
+/* Dynamischer Endpreis brutto = (Boersenpreis netto) * 1,19 + Aufschlag (Netzentgelt, Umlagen, Steuern, Marge) */
+const dynPrice = spot => spot * 1.19 + prefs().dyn;
+
+function tariffCard(sp, t) {
+  if (!sp || !sp.imp_kwh) return '';
+  const p = prefs(), fixed = sp.imp_kwh * p.price, dyn = sp.imp_eur * 1.19 + sp.imp_kwh * p.dyn, diff = fixed - dyn;
+  const avg = sp.imp_kwh > 0 ? sp.imp_eur / sp.imp_kwh : null;
+  return `<h2>Tarifvergleich</h2>
+    <div class="card">
+      <div class="grid3">
+        ${kpiTile('Netzbezug', nf(sp.imp_kwh, 1), 'kWh')}
+        ${kpiTile('Dein Tarif', nf(fixed, 2), '€')}
+        ${kpiTile('Dynamisch', nf(dyn, 2), '€')}
+      </div>
+      <p class="summary" style="font-size:15px">${diff >= 0 ? `Mit dynamischem Tarif <b>${nf(diff, 2)} € günstiger</b>.` : `Mit dynamischem Tarif <b>${nf(-diff, 2)} € teurer</b>.`}
+        Bezogen hast du im Schnitt zu ${avg == null ? '–' : nf(avg * 100, 1)} ct Börsenpreis.${sp.exp_kwh ? ` Deine Einspeisung war an der Börse ${nf(sp.exp_eur, 2)} € wert.` : ''}</p>
+      <div class="sub">Gleicher Verbrauch angenommen, ohne Grundgebühr. Aufschlag einstellbar unter Profil.</div>
+    </div>`;
+}
+
+function anomalyCard(t, events) {
+  if (!t) return '';
+  const f = t.flips || 0, bfg = t.bat_from_grid || 0, btg = t.bat_grid || 0;
+  if (!f && bfg < 50 && btg < 50 && !(events && events.length)) return '';
+  const ev = (events || []).map(e => `<div class="item"><div>${new Date(e.start * 1000).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })} bis ${new Date(e.end * 1000).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}</div><div><b>${kwh(e.wh)} kWh</b> <span class="sub">bis ${pw(e.peak).join(' ')}</span></div></div>`).join('');
+  return `<h2>Auffälligkeiten</h2><div class="card">
+    <div class="grid3">${kpiTile('Richtungswechsel', nf(f), '×')}${kpiTile('Aus Netz geladen', kwh(bfg), 'kWh')}${kpiTile('Ins Netz entladen', kwh(btg), 'kWh')}</div>
+    ${ev ? `<div class="list" style="margin-top:8px"><div class="sub">Batterie speiste ins Netz</div>${ev}</div>` : ''}
+    <div class="sub" style="margin-top:8px">Richtungswechsel = Batterie springt zwischen Laden und Entladen über 1 kW.</div></div>`;
 }
 
 /* ---------- Monat ---------- */
@@ -383,9 +467,22 @@ function monthView() {
       ${kpiTile('Bezogen', kwh(T.grid_in), 'kWh')}
       ${kpiTile('Wert', k ? nf(k.value, 0) : '–', '€')}
     </div>
+    ${tariffCard(sumSpot(days), T)}
+    ${anomalyCard(sumKeys(days, ['flips', 'bat_from_grid', 'bat_grid']), null)}
     <details><summary>Als Tabelle anzeigen</summary><table class="data"><tr><th>Tag</th><th>Erzeugt</th><th>Verbraucht</th><th>Einsp.</th><th>Bezug</th></tr>
       ${Object.keys(days).sort().map(dd => { const t = days[dd]; return `<tr><td>${+dd}.</td><td>${kwh(t.pv)}</td><td>${kwh(t.house)}</td><td>${kwh(t.grid_out)}</td><td>${kwh(t.grid_in)}</td></tr>`; }).join('')}
     </table></details>`}`;
+}
+
+function sumSpot(days) {
+  const o = { imp_kwh: 0, imp_eur: 0, exp_kwh: 0, exp_eur: 0 };
+  for (const t of Object.values(days)) if (t.spot) for (const k in o) o[k] += t.spot[k] || 0;
+  return o;
+}
+function sumKeys(days, keys) {
+  const o = {}; for (const k of keys) o[k] = 0;
+  for (const t of Object.values(days)) for (const k of keys) o[k] += t[k] || 0;
+  return o;
 }
 
 function drawMonthChart() {
@@ -429,6 +526,197 @@ function drawMonthChart() {
   }
 }
 
+/* ---------- Statistik ---------- */
+const HM = { pv: ['Sonne', '--pv'], house: ['Verbrauch', '--house'], imp: ['Netzbezug', '--net'], flips: ['Wechsel', '--accent'] };
+
+async function loadStat() {
+  const now = new Date(), y = now.getFullYear();
+  if (!S.statDate) S.statDate = new Date(y, now.getMonth(), 1);
+  S.stat = S.stat || { months: {}, hours: {}, events: [] };
+  const sd = S.statDate, prev = new Date(sd.getFullYear(), sd.getMonth() - 1, 1);
+  const mKeys = []; for (let m = 0; m <= now.getMonth(); m++) mKeys.push(`${y}-${pad(m + 1)}`);
+  mKeys.push(monthKey(new Date(y, now.getMonth() - 1, 1)));
+  const hKeys = [monthKey(sd), monthKey(prev)];
+  const [ms, hs, st] = await Promise.all([
+    Promise.all(mKeys.map(k => S.src.getMonth(k).catch(() => null))),
+    Promise.all(hKeys.map(k => S.src.getDoc('hours', k).catch(() => null))),
+    S.src.getDoc('stats', 'batgrid').catch(() => null)]);
+  mKeys.forEach((k, i) => { S.stat.months[k] = ms[i]; });
+  hKeys.forEach((k, i) => { S.stat.hours[k] = hs[i]; });
+  S.stat.events = (st && st.events) || [];
+  if (S.tab === 'stat') render();
+}
+function shiftStat(n) {
+  const d = new Date(S.statDate.getFullYear(), S.statDate.getMonth() + n, 1);
+  if (monthKey(d) > monthKey(new Date())) return;
+  S.statDate = d; loadStat(); render();
+}
+
+/* alle Tage aus den geladenen Monaten: [{key, t}] aufsteigend */
+function allDays() {
+  const out = [];
+  for (const [mk, doc] of Object.entries((S.stat && S.stat.months) || {})) {
+    if (!doc || !doc.days) continue;
+    for (const [dd, t] of Object.entries(doc.days)) out.push({ key: `${mk}-${dd}`, t });
+  }
+  const seen = new Set();
+  return out.filter(x => !seen.has(x.key) && seen.add(x.key)).sort((a, b) => a.key < b.key ? -1 : 1);
+}
+const dLabel = k => new Date(k + 'T12:00').toLocaleDateString('de-DE', { day: 'numeric', month: 'short' });
+
+function statView() {
+  if (!S.stat) return `<header><div><h1>Statistik</h1></div></header><div class="loading">Wird geladen …</div>`;
+  return `<header><div><h1>Statistik</h1></div></header>
+    ${recordsCard()}
+    ${heatmapCard()}
+    <h2>Typischer Verbrauch</h2>
+    <div class="card"><div class="lab sub">Durchschnitt pro Stunde, ${esc(S.statDate.toLocaleDateString('de-DE', { month: 'long' }))} und Vormonat</div>
+      <div class="chart" id="c-load"></div>
+      <div class="legend"><span><i style="background:var(--house)"></i>Werktag</span><span><i class="dash" style="--c:var(--house)"></i>Wochenende</span></div></div>
+    ${baseLoadCard()}
+    ${batteryCard()}
+    ${anomalyStatCard()}`;
+}
+
+function recordsCard() {
+  const days = allDays().filter(x => x.t && x.t.pv != null);
+  if (!days.length) return '';
+  const best = (f) => days.reduce((a, b) => (f(b) ?? -1) > (f(a) ?? -1) ? b : a);
+  const bPv = best(x => x.t.pv), bPeak = best(x => x.t.peak_pv), bHouse = best(x => x.t.house);
+  const aut = x => x.t.house > 500 && x.t.grid_in != null && x.t.grid_in <= Math.max(50, x.t.house * 0.01);
+  let cur = 0, longest = 0, run = 0;
+  for (const x of days) { run = aut(x) ? run + 1 : 0; longest = Math.max(longest, run); }
+  for (let i = days.length - 1; i >= 0 && aut(days[i]); i--) cur++;
+  const yr = days.filter(x => x.key.startsWith(String(new Date().getFullYear())));
+  const ySum = k => yr.reduce((a, x) => a + (x.t[k] || 0), 0);
+  const row = (l, v, sub) => `<div class="item"><div>${l}</div><div style="text-align:right"><b>${v}</b><div class="sub">${sub}</div></div></div>`;
+  return `<h2>Rekorde</h2><div class="card list rec">
+    ${row('Bester Tag', kwh(bPv.t.pv) + ' kWh', dLabel(bPv.key))}
+    ${bPeak.t.peak_pv ? row('Höchste Leistung', pw(bPeak.t.peak_pv).join(' '), dLabel(bPeak.key)) : ''}
+    ${row('Höchster Verbrauch', kwh(bHouse.t.house) + ' kWh', dLabel(bHouse.key))}
+    ${row('Autark am Stück', nf(cur) + (cur === 1 ? ' Tag' : ' Tage'), 'längste Serie ' + nf(longest))}
+    ${row('Erzeugt ' + new Date().getFullYear(), kwh(ySum('pv')) + ' kWh', 'seit Beginn der Aufzeichnung')}
+  </div>`;
+}
+
+function heatmapCard() {
+  const sd = S.statDate, mk = monthKey(sd), H = S.stat.hours[mk] || {}, metric = S.hmMetric || 'pv';
+  const n = new Date(sd.getFullYear(), sd.getMonth() + 1, 0).getDate();
+  let max = 0;
+  for (const d of Object.values(H)) for (const v of Object.values((d && d[metric]) || {})) max = Math.max(max, v);
+  const [label, color] = HM[metric];
+  const fmtV = v => metric === 'flips' ? nf(v) + ' ×' : kwh(v) + ' kWh';
+  let cells = '';
+  for (let h = 0; h < 24; h++) for (let dd = 1; dd <= n; dd++) {
+    const v = (((H[pad(dd)] || {})[metric]) || {})[pad(h)] || 0;
+    const pctv = max ? Math.round(8 + 92 * v / max) : 0;
+    const bg = v > 0 ? `color-mix(in srgb, var(${color}) ${pctv}%, var(--grid))` : 'var(--grid)';
+    cells += `<i style="background:${bg}" data-cell="${dd}|${h}|${v}" title="${dd}. ${pad(h)}–${pad(h + 1)} Uhr: ${fmtV(v)}"></i>`;
+  }
+  const isNow = mk === monthKey(new Date());
+  return `<h2>Heatmap</h2><div class="card">
+    <div class="daynav" style="margin-top:0"><button data-act="stat-1" aria-label="Vorheriger Monat">‹</button>
+      <b>${esc(sd.toLocaleDateString('de-DE', { month: 'long', year: 'numeric' }))}</b>
+      <button data-act="stat+1" aria-label="Nächster Monat" ${isNow ? 'disabled' : ''}>›</button></div>
+    <div class="seg">${Object.entries(HM).map(([k, [l]]) => `<button data-hm="${k}" class="${k === metric ? 'on' : ''}">${l}</button>`).join('')}</div>
+    <div class="hm-wrap"><div class="hm-y" style="grid-template-rows:repeat(24,1fr)">${Array.from({ length: 24 }, (_, h) => `<span>${h % 6 === 0 ? pad(h) : ''}</span>`).join('')}</div>
+      <div class="hm" style="grid-template-columns:repeat(${n},minmax(0,1fr))">${cells}</div></div>
+    <div class="sub" id="hm-info" style="margin-top:8px">${label} je Stunde (Zeile) und Tag (Spalte). Antippen für Details. Maximum ${fmtV(max)}.</div>
+  </div>`;
+}
+
+function hoursByDay() {
+  const out = [];
+  for (const [mk, doc] of Object.entries(S.stat.hours)) {
+    if (!doc) continue;
+    for (const [dd, H] of Object.entries(doc)) if (H && H.house) out.push({ key: `${mk}-${dd}`, H });
+  }
+  return out.sort((a, b) => a.key < b.key ? -1 : 1);
+}
+
+function baseLoadCard() {
+  /* Grundlast: niedrigster Stundenverbrauch zwischen 1 und 5 Uhr (Wh in einer Stunde = mittlere Leistung in W) */
+  const today = dayKey(new Date());
+  const days = hoursByDay().filter(x => x.key < today).map(x => {
+    const v = [1, 2, 3, 4].map(h => x.H.house[pad(h)]).filter(v => v != null && v > 0);
+    return v.length >= 3 ? { key: x.key, w: Math.min(...v) } : null;
+  }).filter(Boolean);
+  if (days.length < 2) return '';
+  const avg = a => a.reduce((s, x) => s + x.w, 0) / a.length;
+  const last = days.slice(-7), prev = days.slice(-14, -7), lo = days.reduce((a, b) => b.w < a.w ? b : a);
+  const a = avg(last), kwhYear = a * 8.76;
+  return `<h2>Grundlast</h2><div class="card">
+    <div class="grid3">
+      ${kpiTile('Letzte 7 Tage', nf(a), 'W')}
+      ${kpiTile('Woche davor', prev.length ? nf(avg(prev)) : '–', 'W')}
+      ${kpiTile('Tiefster Wert', nf(lo.w), 'W')}
+    </div>
+    <p class="summary" style="font-size:15px">Das Haus braucht nachts dauerhaft etwa ${nf(a)} W. Aufs Jahr sind das rund ${nf(kwhYear)} kWh, also etwa ${nf(kwhYear * prefs().price)} € zum Bezugspreis.</p>
+    <div class="sub">Niedrigster Stundenwert zwischen 1 und 5 Uhr. Standby-Geräte, Kühlschrank, Router, Heizungspumpe.</div></div>`;
+}
+
+function batteryCard() {
+  const L = S.live;
+  if (!L || !L.bat_in_total_kwh) return '';
+  const cap = L.bat_kwh || 9.02, cycles = L.bat_out_total_kwh / cap, eff = L.bat_out_total_kwh / L.bat_in_total_kwh;
+  let rest = '–', restNote = 'lädt oder ruht';
+  if ((L.bat_w || 0) > 50 && L.soc > 10) {
+    const h = (L.soc - 10) / 100 * cap * (L.bat_health || 100) / 100 * 1000 / L.bat_w;
+    const until = new Date(Date.now() + h * 3600e3);
+    rest = h > 48 ? '> 48' : nf(h, 1); restNote = 'bis ca. ' + until.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' }) + ' Uhr';
+  }
+  const t = L.today || {};
+  return `<h2>Batterie</h2><div class="card">
+    <div class="grid3">
+      ${kpiTile('Vollzyklen', nf(cycles), '')}
+      ${kpiTile('Wirkungsgrad', nf(eff * 100), '%')}
+      ${kpiTile('Kapazität', nf(L.bat_health), '%')}
+      ${kpiTile('Geladen', nf(L.bat_in_total_kwh / 1000, 2), 'MWh')}
+      ${kpiTile('Entladen', nf(L.bat_out_total_kwh / 1000, 2), 'MWh')}
+      <div class="card tile kpi"><div class="lab">Restlaufzeit</div><div class="val">${rest}<small>${rest === '–' ? '' : 'h'}</small></div><div class="note">${restNote}</div></div>
+    </div>
+    <p class="summary" style="font-size:15px">Seit Inbetriebnahme gingen ${nf(L.bat_in_total_kwh - L.bat_out_total_kwh)} kWh beim Speichern verloren. Bei AC-gekoppelten Speichern sind Wirkungsgrade um 80 bis 90 % üblich.</p>
+    <div class="sub">Temperatur heute ${t.tmin != null ? nf(t.tmin, 1) + ' bis ' + nf(t.tmax, 1) + ' °C' : '–'}. Restlaufzeit bis 10 % Ladestand bei aktueller Entladeleistung.</div></div>`;
+}
+
+function anomalyStatCard() {
+  const days = allDays().slice(-14).reverse();
+  const rows = days.filter(x => x.t).map(x => `<tr><td>${+x.key.slice(8)}.${+x.key.slice(5, 7)}.</td><td>${nf(x.t.flips || 0)}</td><td>${kwh(x.t.bat_from_grid || 0)}</td><td>${kwh(x.t.bat_grid || 0)}</td></tr>`).join('');
+  const ev = (S.stat.events || []).slice(-10).reverse().map(e => {
+    const a = new Date(e.start * 1000), b = new Date(e.end * 1000);
+    return `<div class="item"><div>${a.toLocaleDateString('de-DE', { day: 'numeric', month: 'short' })}, ${a.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })} bis ${b.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}</div>
+      <div style="text-align:right"><b>${kwh(e.wh)} kWh</b><div class="sub">bis ${pw(e.peak).join(' ')}${e.soc != null ? ', Akku ' + nf(e.soc) + ' %' : ''}</div></div></div>`;
+  }).join('');
+  return `<h2>Auffälligkeiten</h2><div class="card">
+    <table class="data"><tr><th>Tag</th><th>Wechsel</th><th>aus Netz kWh</th><th>ins Netz kWh</th></tr>${rows}</table>
+    <div class="list" style="margin-top:14px"><div class="sub">Batterie speiste ins Netz</div>${ev || '<div class="sub" style="padding:10px 0">Bisher keine Ereignisse erfasst.</div>'}</div>
+    <div class="sub" style="margin-top:8px">Wechsel = Batterie springt zwischen Laden und Entladen über 1 kW. Aus Netz geladen = Ladeleistung über der PV-Leistung.</div></div>`;
+}
+
+function drawStat() {
+  if (!S.stat) return;
+  /* typische Lastkurve: Mittel je Stunde, Werktag gegen Wochenende */
+  const acc = { wd: Array.from({ length: 24 }, () => []), we: Array.from({ length: 24 }, () => []) };
+  const today = dayKey(new Date());
+  for (const x of hoursByDay()) {
+    if (x.key >= today) continue;
+    const wd = new Date(x.key + 'T12:00').getDay(), grp = wd === 0 || wd === 6 ? 'we' : 'wd';
+    for (let h = 0; h < 24; h++) { const v = x.H.house[pad(h)]; if (v != null) acc[grp][h].push(v); }
+  }
+  const mean = a => a.length ? Math.round(a.reduce((s, v) => s + v, 0) / a.length) : null;
+  const pts = Array.from({ length: 24 }, (_, h) => ({ m: h * 60 + 30, wd: mean(acc.wd[h]), we: mean(acc.we[h]) }));
+  lineChart($('#c-load'), pts, [
+    { key: 'wd', color: '--house', label: 'Werktag' },
+    { key: 'we', color: '--house', label: 'Wochenende', dash: true }
+  ], { h: 180, aria: 'Typischer Verbrauch je Stunde', fmt: v => nf(v) + ' W', tipFmt: v => pw(v).join(' '),
+       xLabel: m => `${pad(Math.floor(m / 60))}–${pad(Math.floor(m / 60) + 1)} Uhr` });
+  const info = $('#hm-info');
+  document.querySelectorAll('[data-cell]').forEach(c => c.addEventListener('click', () => {
+    const [dd, h, v] = c.dataset.cell.split('|'), metric = S.hmMetric || 'pv';
+    info.textContent = `${dd}. ${S.statDate.toLocaleDateString('de-DE', { month: 'long' })}, ${pad(+h)}–${pad(+h + 1)} Uhr: ${metric === 'flips' ? nf(+v) + ' Wechsel' : kwh(+v) + ' kWh ' + HM[metric][0]}`;
+  }));
+}
+
 /* ---------- Profil, Einstellungen, Freigaben ---------- */
 function moreView() {
   const p = prefs(), isAdmin = S.profile.role === 'admin';
@@ -444,7 +732,9 @@ function moreView() {
       <input class="f" id="price" type="number" inputmode="decimal" step="0.01" value="${p.price}">
       <label class="f" for="feed">Einspeisevergütung (€ pro kWh)</label>
       <input class="f" id="feed" type="number" inputmode="decimal" step="0.001" value="${p.feed}">
-      <div class="sub" style="margin-top:10px">"Wert" = selbst genutzter Strom × Strompreis + Einspeisung × Vergütung. Gilt nur auf diesem Gerät.</div>
+      <label class="f" for="dyn">Aufschlag dynamischer Tarif (€ pro kWh, brutto)</label>
+      <input class="f" id="dyn" type="number" inputmode="decimal" step="0.01" value="${p.dyn}">
+      <div class="sub" style="margin-top:10px">"Wert" = selbst genutzter Strom × Strompreis + Einspeisung × Vergütung. Dynamischer Endpreis = Börsenpreis × 1,19 + Aufschlag (Netzentgelt, Umlagen, Steuern, Anbieter). Gilt nur auf diesem Gerät.</div>
     </div>
     ${isAdmin ? `<h2>Zugänge</h2>
       ${pending.length ? `<div class="card list" style="margin-bottom:12px"><div class="sub">Warten auf Freigabe</div>${pending.map(uRow).join('')}</div>` : ''}
@@ -507,7 +797,9 @@ function bindView() {
   on('[data-act="revoke"]', e => { if (confirm('Zugang wirklich sperren?')) S.src.setUser(e.target.dataset.id, { approved: false }); });
   on('[data-act="remove"]', e => { if (confirm('Anfrage ablehnen und entfernen?')) S.src.delUser(e.target.dataset.id); });
   const num = (id, k) => { const el = $('#' + id); if (el) el.addEventListener('change', () => { const v = parseFloat(el.value.replace(',', '.')); if (v >= 0) setPref(k, v); }); };
-  num('price', 'price'); num('feed', 'feed');
+  num('price', 'price'); num('feed', 'feed'); num('dyn', 'dyn');
+  on('[data-act="stat-1"]', () => shiftStat(-1)); on('[data-act="stat+1"]', () => shiftStat(1));
+  document.querySelectorAll('[data-hm]').forEach(b => b.addEventListener('click', () => { S.hmMetric = b.dataset.hm; render(); }));
 }
 
 /* ---------- Laden ---------- */
@@ -515,7 +807,9 @@ let dayUnsub = null;
 async function loadDay() {
   if (dayUnsub) { dayUnsub(); dayUnsub = null; }
   const k = dayKey(S.dayDate);
-  S.day = undefined;
+  S.day = undefined; S.dayPrices = null; S.dayForecast = null;
+  Promise.all([S.src.getDoc('prices', k).catch(() => null), S.src.getDoc('forecast', k).catch(() => null)])
+    .then(([pr, fc]) => { if (dayKey(S.dayDate) !== k) return; S.dayPrices = pr; S.dayForecast = fc; if (S.tab === 'day') render(); });
   if (k === dayKey(new Date())) dayUnsub = S.src.onDay(k, d => { S.day = d; if (S.tab === 'day') render(); });
   else { S.day = await S.src.getDay(k).catch(() => null); if (S.tab === 'day') render(); }
 }
@@ -527,6 +821,7 @@ function setTab(t) {
   S.tab = t; setPref('tab', t);
   if (t === 'day') { if (S.day === undefined || S.day === null) loadDay(); }
   if (t === 'month') loadMonth();
+  if (t === 'stat') loadStat();
   render(); window.scrollTo(0, 0);
 }
 
@@ -545,7 +840,7 @@ async function start() {
       if (S.profile.approved && !was) {
         S.src.onLive(l => { S.live = l; if (S.tab === 'live') render(); });
         if (S.profile.role === 'admin') S.src.onUsers(u => { S.users = u.sort((a, b) => (a.created || 0) - (b.created || 0)); if (S.tab === 'more') render(); });
-        loadDay(); if (S.tab === 'month') loadMonth();
+        loadDay(); if (S.tab === 'month') loadMonth(); if (S.tab === 'stat') loadStat();
       }
       render();
     });
