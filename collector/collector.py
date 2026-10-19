@@ -251,7 +251,8 @@ def price_at(ts):
 # ---------- Hauptschleife ----------
 COUNTERS = ("grid_in_si_wh", "grid_out_si_wh", "bat_in_wh", "bat_out_wh", "pv_total_wh")
 EST_WINDOW_S = int(os.getenv("EST_WINDOW_S", "180"))
-BTG_ON, BTG_OFF = 300, 150  # Batterie -> Netz: Ereignis ab 300 W, Ende unter 150 W
+BTG_ON, BTG_OFF = 300, 150
+SI_STALE_S = int(os.getenv("SI_STALE_S", "600"))  # SI-Netzzaehler laenger unveraendert -> Schaetzung ungueltig  # Batterie -> Netz: Ereignis ab 300 W, Ende unter 150 W
 
 def r1(x):
     return None if x is None else round(x, 1)
@@ -268,6 +269,7 @@ def main():
     extra = {}     # Tageswerte, die nicht aus Zaehlern kommen (Spitzen, Batterie->Netz)
     pend = {}      # aufgelaufene Energie seit dem letzten Schreiben
     ev = None      # laufendes Ereignis Batterie -> Netz
+    last_si, si_changed = None, 0  # letzter SI-Zaehlerstand und Zeitpunkt der letzten Aenderung
     last_dir = 0   # letzte starke Batterie-Richtung: +1 entladen, -1 laden (fuer Richtungswechsel)
     last_live = last_point = 0
     prev = time.time()
@@ -287,6 +289,15 @@ def main():
             hist = [h for h in hist if now - h[0] <= 900]
         if "grid_in_w" in d:
             grid = d["grid_in_w"] - d["grid_out_w"]  # positiv = Bezug, negativ = Einspeisung
+        si = (d.get("grid_in_si_wh"), d.get("grid_out_si_wh"))
+        if si[0] is not None and si != last_si:
+            if last_si is not None:
+                si_changed = now
+            last_si = si
+        if "grid_in_w" in d:
+            pass
+        elif now - si_changed > SI_STALE_S:
+            pass  # Zaehler stehen still: Netz unbekannt statt falsch 0
         elif hist and now - hist[0][0] >= 60:
             # Rueckfall: mittlere Netzleistung aus Zaehlerdifferenz der letzten EST_WINDOW_S Sekunden
             old = next((h for h in hist if now - h[0] <= EST_WINDOW_S), hist[0])
